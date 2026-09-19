@@ -1,0 +1,1016 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Kotak Petualang - Platformer Mobile</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    width:100%; height:100%; overflow:hidden;
+    background:#000;
+    touch-action:none;
+    user-select:none;
+    -webkit-user-select:none;
+    -webkit-touch-callout:none;
+  }
+  #gameContainer {
+    position:fixed; inset:0;
+    touch-action:none;
+  }
+  #gameCanvas {
+    display:block;
+    width:100%; height:100%;
+    touch-action:none;
+  }
+  #controls {
+    position:fixed; inset:0;
+    pointer-events:none;
+    z-index:20;
+  }
+  .btn {
+    position:absolute;
+    border-radius:50%;
+    background:rgba(255,255,255,0.22);
+    border:3px solid rgba(255,255,255,0.55);
+    display:flex; align-items:center; justify-content:center;
+    color:rgba(255,255,255,0.9);
+    font-family:sans-serif;
+    font-weight:bold;
+    pointer-events:none;
+    user-select:none;
+    transition:background 0.05s linear;
+  }
+  .btn.active {
+    background:rgba(255,255,255,0.55);
+  }
+  #btnLeft {
+    bottom: calc(22px + env(safe-area-inset-bottom));
+    left: calc(18px + env(safe-area-inset-left));
+    width:78px; height:78px;
+    font-size:34px;
+  }
+  #btnRight {
+    bottom: calc(22px + env(safe-area-inset-bottom));
+    left: calc(108px + env(safe-area-inset-left));
+    width:78px; height:78px;
+    font-size:34px;
+  }
+  #btnJump {
+    bottom: calc(28px + env(safe-area-inset-bottom));
+    right: calc(24px + env(safe-area-inset-right));
+    width:104px; height:104px;
+    font-size:16px;
+  }
+  #orientationOverlay {
+    position:fixed; inset:0;
+    background:#111;
+    color:#fff;
+    display:none;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    z-index:100;
+    font-family:sans-serif;
+    text-align:center;
+    padding:20px;
+  }
+  #orientationOverlay .icon {
+    font-size:64px;
+    margin-bottom:16px;
+    animation: rotateHint 1.6s ease-in-out infinite;
+  }
+  @keyframes rotateHint {
+    0%,100% { transform:rotate(0deg); }
+    50% { transform:rotate(90deg); }
+  }
+  #orientationOverlay p {
+    font-size:18px;
+    max-width:300px;
+  }
+</style>
+</head>
+<body>
+<div id="gameContainer">
+  <canvas id="gameCanvas"></canvas>
+</div>
+
+<div id="controls">
+  <div class="btn" id="btnLeft">&#9664;</div>
+  <div class="btn" id="btnRight">&#9654;</div>
+  <div class="btn" id="btnJump">LOMPAT</div>
+</div>
+
+<div id="orientationOverlay">
+  <div class="icon">&#128241;</div>
+  <p>Putar ponsel Anda ke posisi mendatar (landscape) untuk bermain.</p>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ============================================================
+  // SETUP DASAR CANVAS
+  // ============================================================
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+  const orientationOverlay = document.getElementById('orientationOverlay');
+
+  let logicalWidth = window.innerWidth;
+  let logicalHeight = window.innerHeight;
+  let groundY = 0;
+  let hasBuiltLevel = false;
+
+  function resizeCanvas(){
+    const dpr = window.devicePixelRatio || 1;
+    logicalWidth = window.innerWidth;
+    logicalHeight = window.innerHeight;
+    canvas.style.width = logicalWidth + 'px';
+    canvas.style.height = logicalHeight + 'px';
+    canvas.width = Math.round(logicalWidth * dpr);
+    canvas.height = Math.round(logicalHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const newGroundY = logicalHeight - 46;
+    if (hasBuiltLevel) {
+      const dy = newGroundY - groundY;
+      shiftWorldY(dy);
+      groundY = newGroundY;
+    } else {
+      groundY = newGroundY;
+      buildLevel();
+      hasBuiltLevel = true;
+    }
+    recomputeButtonRects();
+  }
+
+  function checkOrientation(){
+    const isPortrait = window.innerHeight > window.innerWidth;
+    if (isPortrait) {
+      orientationOverlay.style.display = 'flex';
+      paused = true;
+    } else {
+      orientationOverlay.style.display = 'none';
+      paused = false;
+    }
+  }
+
+  // ============================================================
+  // KONSTANTA FISIKA
+  // ============================================================
+  const GRAVITY = 1900;
+  const MOVE_SPEED = 230;
+  const JUMP_V_INITIAL = -430;
+  const JUMP_HOLD_ACCEL = -2600;
+  const JUMP_V_MAX = -760;
+  const JUMP_MAX_HOLD_TIME = 0.22;
+  const COYOTE_TIME = 0.1;
+  const JUMP_BUFFER_TIME = 0.12;
+  const STOMP_BOUNCE = -360;
+  const INVULN_TIME = 1.3;
+  const MAX_DT = 0.033;
+
+  const LEVEL_WIDTH = 3600;
+
+  // ============================================================
+  // LEVEL BLUEPRINT (posisi relatif terhadap ground / offset di atas ground)
+  // ============================================================
+  const groundSegmentsBP = [
+    {x:0,    w:760},
+    {x:880,  w:700},
+    {x:1700, w:900},
+    {x:2700, w:900}
+  ];
+
+  const floatingPlatformsBP = [
+    {x:150,  offset:110, w:140},
+    {x:400,  offset:175, w:120},
+    {x:950,  offset:130, w:150},
+    {x:1150, offset:195, w:140},
+    {x:1450, offset:130, w:130},
+    {x:1780, offset:150, w:160},
+    {x:2050, offset:205, w:140},
+    {x:2350, offset:140, w:150},
+    {x:2850, offset:175, w:140},
+    {x:3100, offset:120, w:160},
+    {x:3300, offset:185, w:140}
+  ];
+
+  const enemiesBP = [
+    {x:300,  offset:0,   rangeMin:200,  rangeMax:600,  vx:70},
+    {x:1000, offset:0,   rangeMin:900,  rangeMax:1400, vx:80},
+    {x:1795, offset:150, rangeMin:1790, rangeMax:1910, vx:50},
+    {x:1900, offset:0,   rangeMin:1780, rangeMax:2150, vx:75},
+    {x:2400, offset:0,   rangeMin:2320, rangeMax:2560, vx:70},
+    {x:2900, offset:0,   rangeMin:2800, rangeMax:3200, vx:85},
+    {x:3110, offset:120, rangeMin:3110, rangeMax:3220, vx:45}
+  ];
+
+  const coinsBP = [
+    {x:150,offset:180},{x:190,offset:180},{x:230,offset:180},
+    {x:420,offset:235},{x:460,offset:235},
+    {x:600,offset:80},{x:640,offset:80},
+    {x:950,offset:190},{x:990,offset:190},{x:1030,offset:190},
+    {x:1160,offset:255},{x:1200,offset:255},
+    {x:1460,offset:190},
+    {x:1780,offset:210},{x:1820,offset:210},{x:1860,offset:210},
+    {x:2060,offset:265},
+    {x:2360,offset:200},{x:2400,offset:200},
+    {x:2850,offset:235},{x:2890,offset:235},
+    {x:3110,offset:180},{x:3150,offset:180},
+    {x:3300,offset:245},{x:3340,offset:245}
+  ];
+
+  const CHECKPOINTS = [0, 900, 1750, 2750];
+
+  let platforms = [];
+  let enemies = [];
+  let coins = [];
+  let flag = null;
+
+  function buildLevel(){
+    platforms = [];
+    groundSegmentsBP.forEach(s => {
+      platforms.push({x:s.x, y:groundY, w:s.w, h:600});
+    });
+    floatingPlatformsBP.forEach(f => {
+      platforms.push({x:f.x, y:groundY - f.offset, w:f.w, h:20});
+    });
+
+    enemies = enemiesBP.map(e => ({
+      x:e.x, y:groundY - e.offset - 34, w:34, h:34,
+      vx:e.vx, minX:e.rangeMin, maxX:e.rangeMax,
+      alive:true
+    }));
+
+    coins = coinsBP.map(c => ({
+      x:c.x, y:groundY - c.offset, r:11, collected:false
+    }));
+
+    flag = {x:3520, y:groundY - 210, w:12, h:210};
+
+    resetPlayer(true);
+  }
+
+  function shiftWorldY(dy){
+    platforms.forEach(p => p.y += dy);
+    enemies.forEach(e => e.y += dy);
+    coins.forEach(c => c.y += dy);
+    if (flag) flag.y += dy;
+    if (player) player.y += dy;
+  }
+
+  // ============================================================
+  // STATE PEMAIN
+  // ============================================================
+  let player = {
+    x:60, y:0, w:38, h:50,
+    vx:0, vy:0,
+    facing:1,
+    grounded:false,
+    coyoteTimer:0,
+    jumpBufferTimer:0,
+    isJumping:false,
+    jumpHoldTime:0,
+    invulnTimer:0,
+    checkpointX:0
+  };
+
+  function resetPlayer(hardReset){
+    player.x = 60;
+    player.y = groundY - 220;
+    player.vx = 0;
+    player.vy = 0;
+    player.facing = 1;
+    player.grounded = false;
+    player.coyoteTimer = 0;
+    player.jumpBufferTimer = 0;
+    player.isJumping = false;
+    player.jumpHoldTime = 0;
+    player.invulnTimer = hardReset ? 0 : INVULN_TIME;
+    if (hardReset) player.checkpointX = 0;
+  }
+
+  function respawnAtCheckpoint(){
+    player.x = player.checkpointX + 20;
+    player.y = groundY - 220;
+    player.vx = 0;
+    player.vy = 0;
+    player.isJumping = false;
+    player.invulnTimer = INVULN_TIME;
+  }
+
+  // ============================================================
+  // GAME STATE
+  // ============================================================
+  let paused = false;
+  let gameState = 'start'; // start | playing | gameover | complete
+  let lives = 3;
+  let score = 0;
+  let coinsCollected = 0;
+  let elapsedTime = 0;
+
+  let camX = 0;
+  let confetti = [];
+  let confettiSpawned = false;
+
+  function fullReset(){
+    lives = 3;
+    score = 0;
+    coinsCollected = 0;
+    elapsedTime = 0;
+    camX = 0;
+    confetti = [];
+    confettiSpawned = false;
+    coins.forEach(c => c.collected = false);
+    enemies.forEach((e,i) => {
+      const bp = enemiesBP[i];
+      e.alive = true;
+      e.x = bp.x;
+      e.vx = bp.vx;
+    });
+    resetPlayer(true);
+    gameState = 'playing';
+  }
+
+  function spawnConfettiBurst(){
+    const colors = ['#ff4d5e','#ffd23f','#3d7bf0','#4caf50','#ff8fab','#ffffff','#ff9f45'];
+    for (let i = 0; i < 140; i++) {
+      confetti.push({
+        x: Math.random() * logicalWidth,
+        y: -20 - Math.random() * logicalHeight,
+        vx: (Math.random() - 0.5) * 90,
+        vy: 120 + Math.random() * 140,
+        size: 5 + Math.random() * 6,
+        color: colors[Math.floor(Math.random() * colors.length)],
+        rot: Math.random() * Math.PI * 2,
+        rotSpeed: (Math.random() - 0.5) * 6
+      });
+    }
+  }
+
+  function updateConfetti(dt){
+    if (confetti.length === 0) return;
+    confetti.forEach(p => {
+      p.vy += 60 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.rot += p.rotSpeed * dt;
+      if (p.y > logicalHeight + 20) {
+        p.y = -20;
+        p.x = Math.random() * logicalWidth;
+        p.vy = 120 + Math.random() * 140;
+      }
+    });
+  }
+
+  function drawConfetti(){
+    confetti.forEach(p => {
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.size/2, -p.size/2, p.size, p.size*0.6);
+      ctx.restore();
+    });
+  }
+
+  function loseLife(){
+    if (player.invulnTimer > 0) return;
+    lives--;
+    if (lives <= 0) {
+      lives = 0;
+      gameState = 'gameover';
+    } else {
+      respawnAtCheckpoint();
+    }
+  }
+
+  function fallIntoPit(){
+    lives--;
+    if (lives <= 0) {
+      lives = 0;
+      gameState = 'gameover';
+    } else {
+      respawnAtCheckpoint();
+    }
+  }
+
+  // ============================================================
+  // INPUT SENTUH (multi-touch, tetap aktif walau sedikit bergeser)
+  // ============================================================
+  const buttonEls = {
+    left: document.getElementById('btnLeft'),
+    right: document.getElementById('btnRight'),
+    jump: document.getElementById('btnJump')
+  };
+  let buttonRects = {};
+  const pressed = {left:false, right:false, jump:false};
+  const touchAssignments = new Map();
+  const DRIFT_MARGIN = 28;
+
+  function recomputeButtonRects(){
+    for (const key in buttonEls) {
+      const r = buttonEls[key].getBoundingClientRect();
+      buttonRects[key] = {
+        left: r.left - DRIFT_MARGIN,
+        right: r.right + DRIFT_MARGIN,
+        top: r.top - DRIFT_MARGIN,
+        bottom: r.bottom + DRIFT_MARGIN
+      };
+    }
+  }
+
+  function pointInRect(x, y, r){
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  }
+
+  function setPressed(key, val){
+    pressed[key] = val;
+    if (val) buttonEls[key].classList.add('active');
+    else buttonEls[key].classList.remove('active');
+  }
+
+  function onJumpPressed(){
+    tryJump();
+  }
+  function onJumpReleased(){
+    player.isJumping = false;
+  }
+
+  function handleStartRestart(clientX, clientY){
+    if (gameState === 'start' || gameState === 'gameover' || gameState === 'complete') {
+      fullReset();
+      return true;
+    }
+    return false;
+  }
+
+  function onTouchStart(e){
+    e.preventDefault();
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      const t = e.changedTouches[i];
+      if (handleStartRestart(t.clientX, t.clientY)) continue;
+      for (const key in buttonRects) {
+        if (pointInRect(t.clientX, t.clientY, buttonRects[key])) {
+          touchAssignments.set(t.identifier, key);
+          setPressed(key, true);
+          if (key === 'jump') onJumpPressed();
+          break;
+        }
+      }
+    }
+  }
+
+  function onTouchEnd(e){
+    e.preventDefault();
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      const t = e.changedTouches[i];
+      const key = touchAssignments.get(t.identifier);
+      if (key) {
+        touchAssignments.delete(t.identifier);
+        let stillActive = false;
+        touchAssignments.forEach(v => { if (v === key) stillActive = true; });
+        if (!stillActive) {
+          setPressed(key, false);
+          if (key === 'jump') onJumpReleased();
+        }
+      }
+    }
+  }
+
+  document.addEventListener('touchstart', onTouchStart, {passive:false});
+  document.addEventListener('touchend', onTouchEnd, {passive:false});
+  document.addEventListener('touchcancel', onTouchEnd, {passive:false});
+  document.addEventListener('touchmove', function(e){ e.preventDefault(); }, {passive:false});
+  document.addEventListener('contextmenu', function(e){ e.preventDefault(); });
+  document.addEventListener('gesturestart', function(e){ e.preventDefault(); });
+
+  // ============================================================
+  // LOMPATAN: coyote time + jump buffer + variable height
+  // ============================================================
+  function tryJump(){
+    if (player.grounded || player.coyoteTimer > 0) {
+      doJump();
+    } else {
+      player.jumpBufferTimer = JUMP_BUFFER_TIME;
+    }
+  }
+
+  function doJump(){
+    player.vy = JUMP_V_INITIAL;
+    player.isJumping = true;
+    player.jumpHoldTime = 0;
+    player.grounded = false;
+    player.coyoteTimer = 0;
+    player.jumpBufferTimer = 0;
+  }
+
+  // ============================================================
+  // UTIL COLLISION
+  // ============================================================
+  function aabbOverlap(a, b){
+    return a.x < b.x + b.w && a.x + a.w > b.x &&
+           a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  function circleAabbOverlap(cx, cy, r, box){
+    const closestX = Math.max(box.x, Math.min(cx, box.x + box.w));
+    const closestY = Math.max(box.y, Math.min(cy, box.y + box.h));
+    const dx = cx - closestX;
+    const dy = cy - closestY;
+    return (dx*dx + dy*dy) < (r*r);
+  }
+
+  // ============================================================
+  // UPDATE
+  // ============================================================
+  function updatePlayerPhysics(dt){
+    // Input horizontal
+    let inputX = 0;
+    if (pressed.left) inputX -= 1;
+    if (pressed.right) inputX += 1;
+    player.vx = inputX * MOVE_SPEED;
+    if (inputX !== 0) player.facing = inputX;
+
+    // Timer coyote & buffer
+    if (player.grounded) player.coyoteTimer = COYOTE_TIME;
+    else player.coyoteTimer = Math.max(0, player.coyoteTimer - dt);
+    player.jumpBufferTimer = Math.max(0, player.jumpBufferTimer - dt);
+
+    // Lompatan variabel: pegang tombol menambah tinggi hingga batas
+    if (player.isJumping && pressed.jump && player.jumpHoldTime < JUMP_MAX_HOLD_TIME && player.vy < 0) {
+      player.vy += JUMP_HOLD_ACCEL * dt;
+      if (player.vy < JUMP_V_MAX) player.vy = JUMP_V_MAX;
+      player.jumpHoldTime += dt;
+    }
+    if (!pressed.jump) {
+      player.isJumping = false;
+    }
+
+    // Gravitasi
+    player.vy += GRAVITY * dt;
+    if (player.vy > 1400) player.vy = 1400;
+
+    // Gerak horizontal + tabrakan
+    player.x += player.vx * dt;
+    for (let i = 0; i < platforms.length; i++) {
+      const p = platforms[i];
+      if (p.y > groundY + 500) continue; // lantai super tebal, skip cek sisi
+      if (aabbOverlap(player, p)) {
+        if (player.vx > 0) player.x = p.x - player.w;
+        else if (player.vx < 0) player.x = p.x + p.w;
+      }
+    }
+    player.x = Math.max(0, Math.min(player.x, LEVEL_WIDTH - player.w));
+
+    // Gerak vertikal + tabrakan
+    const prevTop = player.y;
+    const prevBottom = player.y + player.h;
+    player.y += player.vy * dt;
+    player.grounded = false;
+
+    for (let i = 0; i < platforms.length; i++) {
+      const p = platforms[i];
+      if (!aabbOverlap(player, p)) continue;
+      if (player.vy > 0 && prevBottom <= p.y + 0.6) {
+        player.y = p.y - player.h;
+        player.vy = 0;
+        player.grounded = true;
+        if (player.jumpBufferTimer > 0) {
+          doJump();
+        }
+      } else if (player.vy < 0 && prevTop >= p.y + p.h - 0.6) {
+        player.y = p.y + p.h;
+        player.vy = 0;
+      }
+    }
+
+    // Checkpoint
+    if (player.grounded) {
+      for (let i = CHECKPOINTS.length - 1; i >= 0; i--) {
+        if (player.x >= CHECKPOINTS[i]) {
+          player.checkpointX = Math.max(player.checkpointX, CHECKPOINTS[i]);
+          break;
+        }
+      }
+    }
+
+    // Jatuh ke jurang
+    if (player.y > groundY + 350) {
+      fallIntoPit();
+      return;
+    }
+
+    // Invulnerabilitas
+    if (player.invulnTimer > 0) player.invulnTimer -= dt;
+  }
+
+  function updateEnemies(dt){
+    enemies.forEach(e => {
+      if (!e.alive) return;
+      e.x += e.vx * dt;
+      if (e.x <= e.minX) { e.x = e.minX; e.vx = Math.abs(e.vx); }
+      else if (e.x + e.w >= e.maxX) { e.x = e.maxX - e.w; e.vx = -Math.abs(e.vx); }
+    });
+  }
+
+  function updateEnemyCollisions(){
+    const prevBottom = player.__prevBottomForStomp;
+    enemies.forEach(e => {
+      if (!e.alive) return;
+      if (!aabbOverlap(player, e)) return;
+      const stomping = player.vy > 0 && (player.y + player.h - e.y) < (e.h * 0.6);
+      if (stomping) {
+        e.alive = false;
+        player.vy = STOMP_BOUNCE;
+        score += 0;
+      } else if (player.invulnTimer <= 0) {
+        loseLife();
+        player.vx = (player.x < e.x) ? -180 : 180;
+        player.vy = -260;
+      }
+    });
+  }
+
+  function updateCoins(){
+    coins.forEach(c => {
+      if (c.collected) return;
+      const cx = player.x + player.w/2;
+      const cy = player.y + player.h/2;
+      if (circleAabbOverlap(c.x, c.y, c.r + 6, {x:player.x, y:player.y, w:player.w, h:player.h})) {
+        c.collected = true;
+        score += 100;
+        coinsCollected++;
+      }
+    });
+  }
+
+  function updateFlag(){
+    if (aabbOverlap(player, {x:flag.x - 20, y:flag.y - 20, w:flag.w + 40, h:flag.h + 40})) {
+      gameState = 'complete';
+      if (!confettiSpawned) {
+        spawnConfettiBurst();
+        confettiSpawned = true;
+      }
+    }
+  }
+
+  function updateCamera(dt){
+    const viewW = logicalWidth;
+    const lead = player.facing * 90;
+    const targetCamX = player.x + player.w/2 - viewW/2 + lead;
+    camX += (targetCamX - camX) * Math.min(1, dt * 5);
+    camX = Math.max(0, Math.min(camX, Math.max(0, LEVEL_WIDTH - viewW)));
+  }
+
+  function update(dt){
+    if (gameState !== 'playing') return;
+    elapsedTime += dt;
+    updatePlayerPhysics(dt);
+    if (gameState !== 'playing') return;
+    updateEnemies(dt);
+    updateEnemyCollisions();
+    updateCoins();
+    updateFlag();
+    updateCamera(dt);
+  }
+
+  // ============================================================
+  // RENDER
+  // ============================================================
+  function drawBackground(){
+    const g = ctx.createLinearGradient(0, 0, 0, logicalHeight);
+    g.addColorStop(0, '#5ec8f2');
+    g.addColorStop(1, '#bdeaff');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, logicalWidth, logicalHeight);
+
+    // Matahari
+    ctx.fillStyle = 'rgba(255,250,200,0.9)';
+    ctx.beginPath();
+    ctx.arc(logicalWidth - 70, 70, 40, 0, Math.PI*2);
+    ctx.fill();
+
+    // Lapisan jauh: bukit besar
+    ctx.fillStyle = '#8fd18a';
+    const farOffset = -camX * 0.2;
+    drawHillLayer(farOffset, groundY - 40, 260, 90);
+
+    // Lapisan awan
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    const cloudOffset = -camX * 0.1;
+    drawClouds(cloudOffset);
+
+    // Lapisan dekat: bukit kecil
+    ctx.fillStyle = '#6fc36a';
+    const nearOffset = -camX * 0.4;
+    drawHillLayer(nearOffset, groundY, 160, 55);
+  }
+
+  function drawHillLayer(offset, baseY, spacing, radius){
+    const start = Math.floor((-offset) / spacing) - 1;
+    const end = Math.ceil((logicalWidth - offset) / spacing) + 1;
+    for (let i = start; i <= end; i++) {
+      const cx = i * spacing + offset + spacing/2;
+      ctx.beginPath();
+      ctx.arc(cx, baseY, radius, Math.PI, 0);
+      ctx.fill();
+    }
+  }
+
+  function drawClouds(offset){
+    const spacing = 300;
+    const start = Math.floor((-offset) / spacing) - 1;
+    const end = Math.ceil((logicalWidth - offset) / spacing) + 1;
+    for (let i = start; i <= end; i++) {
+      const cx = i * spacing + offset + 60;
+      const cy = 60 + (i % 3) * 25;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, 34, 16, 0, 0, Math.PI*2);
+      ctx.ellipse(cx + 26, cy + 6, 24, 13, 0, 0, Math.PI*2);
+      ctx.ellipse(cx - 24, cy + 8, 22, 12, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  function drawPlatforms(){
+    platforms.forEach(p => {
+      const sx = p.x - camX;
+      if (sx + p.w < 0 || sx > logicalWidth) return;
+      const isGround = p.h > 100;
+      if (isGround) {
+        ctx.fillStyle = '#8b5a2b';
+        ctx.fillRect(sx, p.y, p.w, Math.min(p.h, logicalHeight - p.y + 50));
+        ctx.fillStyle = '#4caf50';
+        ctx.fillRect(sx, p.y, p.w, 14);
+        ctx.fillStyle = '#3d8b41';
+        for (let i = 0; i < p.w; i += 20) {
+          ctx.fillRect(sx + i, p.y, 10, 4);
+        }
+      } else {
+        ctx.fillStyle = '#c98a4b';
+        ctx.fillRect(sx, p.y, p.w, p.h);
+        ctx.fillStyle = '#4caf50';
+        ctx.fillRect(sx, p.y, p.w, 6);
+        ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(sx, p.y, p.w, p.h);
+      }
+    });
+  }
+
+  function drawCoins(){
+    coins.forEach(c => {
+      if (c.collected) return;
+      const sx = c.x - camX;
+      if (sx < -30 || sx > logicalWidth + 30) return;
+      ctx.save();
+      ctx.translate(sx, c.y);
+      ctx.fillStyle = '#ffd23f';
+      ctx.beginPath();
+      ctx.arc(0, 0, c.r, 0, Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = '#e0a800';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.beginPath();
+      ctx.arc(-3, -3, c.r*0.35, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    });
+  }
+
+  function drawEnemies(){
+    enemies.forEach(e => {
+      if (!e.alive) return;
+      const sx = e.x - camX;
+      if (sx + e.w < 0 || sx > logicalWidth) return;
+      ctx.save();
+      ctx.translate(sx, e.y);
+      ctx.fillStyle = '#8b3a3a';
+      ctx.beginPath();
+      ctx.moveTo(0, e.h);
+      ctx.quadraticCurveTo(0, 0, e.w/2, 0);
+      ctx.quadraticCurveTo(e.w, 0, e.w, e.h);
+      ctx.closePath();
+      ctx.fill();
+      // Kaki
+      ctx.fillStyle = '#5a2323';
+      ctx.fillRect(2, e.h - 6, 8, 6);
+      ctx.fillRect(e.w - 10, e.h - 6, 8, 6);
+      // Mata
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.arc(e.w*0.32, e.h*0.4, 5, 0, Math.PI*2);
+      ctx.arc(e.w*0.68, e.h*0.4, 5, 0, Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle = '#000';
+      ctx.beginPath();
+      ctx.arc(e.w*0.32, e.h*0.4, 2.2, 0, Math.PI*2);
+      ctx.arc(e.w*0.68, e.h*0.4, 2.2, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    });
+  }
+
+  function drawFlag(){
+    const sx = flag.x - camX;
+    if (sx < -60 || sx > logicalWidth + 60) return;
+    ctx.fillStyle = '#999';
+    ctx.fillRect(sx, flag.y, flag.w, flag.h);
+    ctx.fillStyle = '#e63946';
+    ctx.beginPath();
+    ctx.moveTo(sx + flag.w, flag.y + 10);
+    ctx.lineTo(sx + flag.w + 44, flag.y + 26);
+    ctx.lineTo(sx + flag.w, flag.y + 42);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawPlayer(){
+    const sx = player.x - camX;
+    let visible = true;
+    if (player.invulnTimer > 0) {
+      visible = Math.floor(player.invulnTimer * 12) % 2 === 0;
+    }
+    if (!visible) return;
+    ctx.save();
+    ctx.translate(sx, player.y);
+    ctx.fillStyle = '#3d7bf0';
+    ctx.fillRect(0, 0, player.w, player.h);
+    ctx.strokeStyle = '#1f4fb0';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(1, 1, player.w - 2, player.h - 2);
+    // Mata mengikuti arah hadap
+    const eyeOffset = player.facing > 0 ? player.w*0.55 : player.w*0.2;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(eyeOffset, player.h*0.28, 6, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(eyeOffset + player.facing*2, player.h*0.28, 2.6, 0, Math.PI*2);
+    ctx.fill();
+    // Topi kecil
+    ctx.fillStyle = '#d64545';
+    ctx.fillRect(0, -6, player.w, 8);
+    ctx.restore();
+  }
+
+  function formatTime(t){
+    const m = Math.floor(t / 60);
+    const s = Math.floor(t % 60);
+    return (m < 10 ? '0'+m : m) + ':' + (s < 10 ? '0'+s : s);
+  }
+
+  function drawHUD(){
+    ctx.font = 'bold 20px sans-serif';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(0, 0, logicalWidth, 46);
+
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'left';
+    ctx.fillText('Skor: ' + score, 14, 12);
+
+    ctx.fillText('Koin: ' + coinsCollected, 150, 12);
+
+    // Hati / nyawa
+    for (let i = 0; i < 3; i++) {
+      ctx.fillStyle = i < lives ? '#ff4d5e' : 'rgba(255,255,255,0.3)';
+      drawHeart(280 + i*28, 20, 10);
+    }
+
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'right';
+    ctx.fillText(formatTime(elapsedTime), logicalWidth - 14, 12);
+    ctx.textAlign = 'left';
+  }
+
+  function drawHeart(cx, cy, size){
+    ctx.beginPath();
+    const s = size;
+    ctx.moveTo(cx, cy + s*0.3);
+    ctx.bezierCurveTo(cx, cy, cx - s, cy, cx - s, cy + s*0.3);
+    ctx.bezierCurveTo(cx - s, cy + s*0.7, cx, cy + s, cx, cy + s*1.2);
+    ctx.bezierCurveTo(cx, cy + s, cx + s, cy + s*0.7, cx + s, cy + s*0.3);
+    ctx.bezierCurveTo(cx + s, cy, cx, cy, cx, cy + s*0.3);
+    ctx.fill();
+  }
+
+  function drawTapButton(cx, cy, label){
+    const w = 220, h = 54;
+    ctx.fillStyle = '#4caf50';
+    roundRect(cx - w/2, cy - h/2, w, h, 14);
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 3;
+    roundRect(cx - w/2, cy - h/2, w, h, 14);
+    ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, cx, cy + 1);
+    ctx.textBaseline = 'top';
+  }
+
+  function roundRect(x, y, w, h, r){
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function drawOverlayScreen(){
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, logicalWidth, logicalHeight);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    const cx = logicalWidth/2;
+    const cy = logicalHeight/2;
+
+    if (gameState === 'start') {
+      ctx.font = 'bold 30px sans-serif';
+      ctx.fillText('KOTAK PETUALANG', cx, cy - 90);
+      ctx.font = '14px sans-serif';
+      ctx.fillText('Kiri/Kanan untuk bergerak, tombol LOMPAT untuk melompat', cx, cy - 46);
+      ctx.fillText('Tahan tombol lompat lebih lama untuk lompatan lebih tinggi', cx, cy - 24);
+      drawTapButton(cx, cy + 40, 'TAP UNTUK MAIN');
+    } else if (gameState === 'gameover') {
+      ctx.font = 'bold 32px sans-serif';
+      ctx.fillText('GAME OVER', cx, cy - 90);
+      ctx.font = '18px sans-serif';
+      ctx.fillText('Skor: ' + score, cx, cy - 42);
+      ctx.fillText('Koin: ' + coinsCollected, cx, cy - 16);
+      ctx.fillText('Waktu: ' + formatTime(elapsedTime), cx, cy + 10);
+      drawTapButton(cx, cy + 70, 'TAP UNTUK MAIN LAGI');
+    } else if (gameState === 'complete') {
+      drawConfetti();
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 32px sans-serif';
+      ctx.fillText('LEVEL SELESAI!', cx, cy - 90);
+      ctx.font = '18px sans-serif';
+      ctx.fillText('Skor: ' + score, cx, cy - 42);
+      ctx.fillText('Koin Terkumpul: ' + coinsCollected + ' / ' + coinsBP.length, cx, cy - 16);
+      ctx.fillText('Waktu Tempuh: ' + formatTime(elapsedTime), cx, cy + 10);
+      drawTapButton(cx, cy + 70, 'TAP UNTUK MAIN LAGI');
+    }
+    ctx.textAlign = 'left';
+  }
+
+  function render(){
+    ctx.clearRect(0, 0, logicalWidth, logicalHeight);
+    drawBackground();
+    drawPlatforms();
+    drawCoins();
+    drawFlag();
+    drawEnemies();
+    drawPlayer();
+    drawHUD();
+    if (gameState !== 'playing') {
+      drawOverlayScreen();
+    }
+  }
+
+  // ============================================================
+  // LOOP UTAMA
+  // ============================================================
+  let lastTime = null;
+  function loop(ts){
+    if (lastTime === null) lastTime = ts;
+    let dt = (ts - lastTime) / 1000;
+    lastTime = ts;
+    if (dt > MAX_DT) dt = MAX_DT;
+
+    if (!paused) {
+      update(dt);
+      updateConfetti(dt);
+    }
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  // ============================================================
+  // INISIALISASI
+  // ============================================================
+  window.addEventListener('resize', function(){ resizeCanvas(); checkOrientation(); });
+  window.addEventListener('orientationchange', function(){
+    setTimeout(function(){ resizeCanvas(); checkOrientation(); }, 50);
+  });
+
+  resizeCanvas();
+  checkOrientation();
+  requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
